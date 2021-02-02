@@ -3,9 +3,12 @@
 -- @author Abelidze
 -- @copyright Atom-TM 2020
 
+local md5 = require 'md5'
 local enet = require 'enet'
 local Lobby = require 'lobby'
 
+local tostring = _G.tostring
+local unpack = table.unpack or unpack
 local max = math.max
 local ceil = math.ceil
 local strchar = string.char
@@ -14,22 +17,35 @@ local strjoin = table.concat
 local strmatch = string.match
 local strgmatch = string.gmatch
 local strformat = string.format
+local mdsum = md5.sumhexa
 
 -- Client message codes
-local INIT = 1
+local LOGIN = 1
 local LIST = 2
 local FIND = 3
 local RELAY = 4
 local LEAVE = 5
+local INVITE = 7
 
-local clients = { count = 0 }
 local relayid = { }
-local usernames = { }
+local clients = { count = 0 }
+local users = { }
 
+local SEP = 29
 local PEERS_MAX_COUNT = 1000
 local RELAY_MAX_COUNT = 100
 for i = 1, RELAY_MAX_COUNT do
 	relayid[i] = RELAY_MAX_COUNT - i + 1
+end
+
+local NETRECORD_PATTERN = '([^' .. strchar(SEP) .. ']+)'
+local function parse(payload)
+	local arr, i = { }, 1
+	for v in strgmatch(payload, NETRECORD_PATTERN) do
+		arr[i] = v
+		i = i + 1
+	end
+	return unpack(arr)
 end
 
 local function convertIP(ip)
@@ -58,16 +74,19 @@ local MasterEvents = {
 
 	connect = function (self, event)
 		local id = event.peer:connect_id()
-		if not clients[id] then
-			clients[id] = {
-				ip = nil,
-				name = nil,
-				lobby = nil,
-				relays = { },
-				peer = event.peer
-			}
-			clients.count = clients.count + 1
-		end
+		if clients[id] then return end
+		 local client = {
+			id = mdsum(tostring(id)),
+			ip = nil,
+			name = nil,
+			lobby = nil,
+			relays = { },
+			peer = event.peer
+		}
+		clients[id] = client
+		users[client.id] = id
+		clients.count = clients.count + 1
+		print('CONNECT', client.id, 'Count:', clients.count)
 	end,
 
 	disconnect = function (self, event)
@@ -75,24 +94,39 @@ local MasterEvents = {
 		for id, client in pairs(clients) do
 			if id ~= 'count' and client.peer == peer then
 				if client.name then
-					usernames[client.name] = nil
 					print('LOGOUT', client.name)
+				else
+					print('D/C', id)
 				end
 				if client.lobby then
 					client.lobby:remove(id)
 				end
 				for channel, relay in pairs(client.relays) do
 					print('RDROP', strformat('%s <-> %s', client.name, relay.name))
-					relay.peer:send(strformat('%c%s%c%s%c%s', RELAY, client.name, 29, 0, 29, channel))
+					relay.peer:send(strformat('%c%s%c%s%c%s', RELAY, client.name, SEP, 0, SEP, channel))
 					relay.relays[channel] = nil
 					client.relays[channel] = nil
 					relayid[#relayid + 1] = channel
 				end
 				clients[id] = nil
+				users[client.id] = nil
 				clients.count = clients.count - 1
 				break
 			end
 		end
+	end,
+
+	[LOGIN] = function (self, event, client, payload)
+		local ip, name = parse(payload)
+		if not name or client.name then return end
+		if users[mdsum(name)] then
+			client.peer:disconnect(228)
+			return
+		end
+		users[client.id] = nil
+		client.id, client.ip, client.name = mdsum(name), ip, name
+		users[client.id] = event.peer:connect_id()
+		print('LOGIN', client.id, name)
 	end,
 
 	[LEAVE] = function (self, event, client, payload)
@@ -101,81 +135,84 @@ local MasterEvents = {
 		end
 	end,
 
-	[INIT] = function (self, event, client, payload)
-		client.ip, client.name = strmatch(payload, '^(%S*);(%S*)')
-		if not client.name then return end
-		if usernames[client.name] then
-			client.peer:disconnect(228)
-			return
-		end
-		usernames[client.name] = event.peer:connect_id()
-		print('LOGIN', event.peer:connect_id(), client.name, 'Count:', clients.count)
-	end,
-
-	[LIST] = function (self, event, client, payload)
-		local lobbies, i, c = { }
-		for id, lobby in Lobby:all() do
-			i, c = next(lobby.players)
-			if c then
-				lobbies[#lobbies + 1] = strformat('%s[%d]', c.name, lobby.size)
-			end
-		end
-		client.peer:send( strformat('%c%s', LIST, strjoin(lobbies, strchar(29))) )
-	end,
-
-	[RELAY] = function (self, e, c1, payload)
-		local id = usernames[payload]
-		local c2 = id and clients[id]
-		if not c2 or #relayid == 0 then return end
-		-- Save relay remapping and notify clients about successful connection
-		if e.channel == relayid[#relayid] then
-			print('RACCEPT', strformat('%s <-> %s [%s]', c1.name, c2.name, e.channel))
-			relayid[#relayid] = nil
-			if not c2.relays[e.channel] then
-				c2.relays[e.channel] = c1
-				c2.peer:send(strformat('%c%s%c%s%c%s', RELAY, c1.name, 29, max(1, ceil(c1.peer:round_trip_time() / 2)), 29, e.channel), e.channel)
-			end
-			if not c1.relays[e.channel] then
-				c1.relays[e.channel] = c2
-				c1.peer:send(strformat('%c%s%c%s%c%s', RELAY, c2.name, 29, max(1, ceil(c2.peer:round_trip_time() / 2)), 29, e.channel), e.channel)
-			end
-			return
-		-- Relay is only possible between directly connected peers
-		elseif e.channel > 0 then
-			print('RREJECT', strformat('%s <-> %s [%s]', c1.name, c2.name, e.channel))
-			return
-		end
-		-- Reply for the first request with a free relay channel
-		print('RELAY', strformat('%s <-> %s [%s]', c1.name, c2.name, relayid[#relayid]))
-		c1.peer:send(strformat('%c%s%c%s%c%s', RELAY, payload, 29, max(1, ceil(c2.peer:round_trip_time() / 2)), 29, relayid[#relayid]))
-	end,
-
 	[FIND] = function (self, event, c1, payload)
 		local id1 = event.peer:connect_id()
-		local id2 = usernames[payload]
-		local c2 = id2 and clients[id2]
-		if not c2 then
-			local lobby = Lobby()
-			print('LOBBY', lobby.id, c1.name)
-			lobby:add(id1, c1)
+		local lobby = Lobby:get(payload)
+		if lobby then
+			if lobby:add(id1, c1) then
+				print('ADD', lobby.id, c1.name)
+			end
 			return
 		end
-		if c1.lobby then
-			print('ADD', c1.lobby.id, c2.name)
-			c1.lobby:add(id2, c2)
+		local id2 = users[mdsum(payload)]
+		local c2 = id2 and clients[id2]
+		if not c2 then
+			lobby = Lobby()
+			print('LOBBY', lobby.id, c1.name)
+			lobby:add(id1, c1)
+		elseif c1.lobby then
+			if c1.lobby:add(id2, c2) then
+				print('ADD', c1.lobby.id, c2.name)
+			end
 		elseif c2.lobby then
-			print('ADD', c2.lobby.id, c1.name)
-			c2.lobby:add(id1, c1)
+			if c2.lobby:add(id1, c1) then
+				print('ADD', c2.lobby.id, c1.name)
+			end
 		else
-			local lobby = Lobby()
+			lobby = Lobby()
 			print('LOBBY', lobby.id, c1.name, c2.name)
 			lobby:add(id1, c1)
 			lobby:add(id2, c2)
 		end
 	end,
+
+	[LIST] = function (self, event, client, payload)
+		local lobbies = { }
+		local max_count = tonumber(payload) or 1000
+		for id, lobby in Lobby:all() do
+			local players = { }
+			for _, player in pairs(lobby.players) do
+				players[#players + 1] = strformat('"%s"', player.name)
+			end
+			lobbies[#lobbies + 1] = strformat('{"id":"%s","players":[%s]}', lobby.id, strjoin(players, ','))
+			if #lobbies >= max_count then
+				break
+			end
+		end
+		client.peer:send( strformat('%c%s', LIST, strjoin(lobbies, strchar(SEP))) )
+	end,
+
+	[RELAY] = function (self, e, c1, payload)
+		local id = users[payload] or users[mdsum(payload)]
+		local c2 = id and clients[id]
+		if not c2 or #relayid == 0 then return end
+		-- Save relay remapping and notify clients about successful connection
+		local p1, p2 = c1.name or c1.id, c2.name or c2.id
+		if e.channel == relayid[#relayid] then
+			print('RACCEPT', strformat('%s <-> %s [%s]', p1, p2, e.channel))
+			relayid[#relayid] = nil
+			if not c2.relays[e.channel] then
+				c2.relays[e.channel] = c1
+				c2.peer:send(strformat('%c%s%c%s%c%s', RELAY, p1, SEP, max(1, ceil(c1.peer:round_trip_time() / 2)), SEP, e.channel), e.channel)
+			end
+			if not c1.relays[e.channel] then
+				c1.relays[e.channel] = c2
+				c1.peer:send(strformat('%c%s%c%s%c%s', RELAY, p2, SEP, max(1, ceil(c2.peer:round_trip_time() / 2)), SEP, e.channel), e.channel)
+			end
+			return
+		-- Relay is only possible between directly connected peers
+		elseif e.channel > 0 then
+			print('RREJECT', strformat('%s <-> %s [%s]', p1, p2, e.channel))
+			return
+		end
+		-- Reply for the first request with a free relay channel
+		print('RELAY', strformat('%s <-> %s [%s]', p1, p2, relayid[#relayid]))
+		c1.peer:send(strformat('%c%s%c%s%c%s', RELAY, payload, SEP, max(1, ceil(c2.peer:round_trip_time() / 2)), SEP, relayid[#relayid]))
+	end,
 }
 
 local server = enet.host_create('*:12565', max(PEERS_MAX_COUNT, RELAY_MAX_COUNT * 2), RELAY_MAX_COUNT + 1)
+math.randomseed(os.time())
 print('MasterServer started:', server:get_socket_address())
 while true do
 	local event = server:service(50)
